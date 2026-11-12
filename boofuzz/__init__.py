@@ -57,6 +57,8 @@ from .repeater import CountRepeater, Repeater, TimeRepeater
 from .sessions import open_test_run, Session, Target
 from .protocol_session import ProtocolSession
 from .protocol_session_reference import ProtocolSessionReference
+from .state_feedback import FeedbackCaseIterator, ResponseStateTracker, StateObservation
+from .crash_minimizer import CrashMinimizer, MinimizedCrash
 
 # workaround to make Tornado work in Python 3.8
 # https://github.com/tornadoweb/tornado/issues/2608

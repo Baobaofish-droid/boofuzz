@@ -18,6 +18,20 @@ Test Case Context
     :undoc-members:
     :show-inheritance:
 
+Response State Feedback
+=======================
+.. automodule:: boofuzz.state_feedback
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+Crash Minimization
+==================
+.. automodule:: boofuzz.crash_minimizer
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 Helpers
 =======
 .. automodule:: boofuzz.helpers

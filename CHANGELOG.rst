@@ -6,6 +6,12 @@ Upcomming
 Features
 ^^^^^^^^
 - Added Python 3.13 compatibility.
+- Added opt-in response state feedback: ``Session(enable_state_feedback=True)`` classifies target
+  responses into states, logs state exploration progress, and can dynamically escalate interesting
+  message paths to deeper combinatorial exploration (``feedback_escalate=True``).
+- Added opt-in crash replay and minimization: ``Session(minimize_crashes=True)`` confirms failures
+  by replaying the transmitted message sequence, minimizes it by removing handshake messages and
+  irrelevant bytes, and exports the minimal reproducing sequence.
 
 Fixes
 ^^^^^

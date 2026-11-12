@@ -1,3 +1,4 @@
+import copy
 import datetime
 import errno
 import itertools
@@ -31,9 +32,11 @@ from boofuzz import (
     primitives,
 )
 from boofuzz.exception import BoofuzzFailure
+from boofuzz.crash_minimizer import CrashMinimizer
 from boofuzz.monitors import CallbackMonitor
 from boofuzz.mutation_context import MutationContext
 from boofuzz.protocol_session import ProtocolSession
+from boofuzz.state_feedback import FeedbackCaseIterator, ResponseStateTracker
 from boofuzz.web.app import app
 from .connection import Connection
 from .session_info import SessionInfo
@@ -101,6 +104,24 @@ class Session(pgraph.Graph):
         db_filename (str):      Filename to store sqlite db for test results and case information.
                                 Defaults to ./boofuzz-results/{uniq_timestamp}.db
         web_address:            Address where's Boofuzz logger exposed. Default 'localhost'
+        enable_state_feedback (bool): Track target responses per test case, classify them into
+                                response states and log state exploration progress. Default False.
+        state_classifier (callable): Optional callable mapping response bytes to a hashable
+                                state key. Defaults to a content hash of the response.
+        feedback_escalate (bool):  When a new response state is discovered, dynamically
+                                schedule deeper combinatorial test cases for the message path
+                                that revealed the state. Requires enable_state_feedback.
+                                Default False.
+        feedback_escalation_limit (int): Maximum number of extra test cases injected per
+                                escalation. Default 64.
+        minimize_crashes (bool):   After a detected failure, replay the transmitted message
+                                sequence to confirm the failure signature, minimize the
+                                sequence (removing handshake messages and irrelevant bytes)
+                                and export the minimal reproducing sequence. Default False.
+        crash_verify_count (int):  Number of replay rounds a sequence must reproduce the same
+                                failure signature to be considered stable. Default 1.
+        minimized_crash_dir (str): Directory to export minimized crash sequences to.
+                                Defaults to ./boofuzz-results/minimized-{run_id}.
 
     .. versionchanged:: 0.4.2
        This class has been moved into the sessions subpackage. The full path is now boofuzz.sessions.session.Session.
@@ -138,6 +159,13 @@ class Session(pgraph.Graph):
         target=None,
         web_address=constants.DEFAULT_WEB_UI_ADDRESS,
         db_filename=None,
+        enable_state_feedback=False,
+        state_classifier=None,
+        feedback_escalate=False,
+        feedback_escalation_limit=64,
+        minimize_crashes=False,
+        crash_verify_count=1,
+        minimized_crash_dir=None,
     ):
         self._ignore_connection_reset = ignore_connection_reset
         self._ignore_connection_aborted = ignore_connection_aborted
@@ -238,6 +266,21 @@ class Session(pgraph.Graph):
         self.is_paused = False
         self.crashing_primitives = {}
         self.on_failure = event_hook.EventHook()
+
+        # response state feedback / adaptive scheduling
+        self._enable_state_feedback = enable_state_feedback
+        self.state_tracker = ResponseStateTracker(classifier=state_classifier)
+        self._feedback_escalate = feedback_escalate
+        self._feedback_escalation_limit = feedback_escalation_limit
+        self._feedback_iterator = None
+        self._escalated_paths = set()
+
+        # crash replay and minimization
+        self._minimize_crashes = minimize_crashes
+        self._crash_verify_count = crash_verify_count
+        self._minimized_crash_dir = minimized_crash_dir
+        self.minimized_crashes = {}
+        self._current_case_transmissions = []
 
         # import settings if they exist.
         self.import_file()
@@ -631,6 +674,103 @@ class Session(pgraph.Graph):
         else:
             return False
 
+    def _update_state_feedback(self, mutation_context):
+        """Classify the last target response into a state and react to new states.
+
+        Logs state exploration progress through the fuzz data logger and, when
+        feedback escalation is enabled, dynamically schedules deeper test cases
+        for message paths that revealed a previously unseen response state.
+
+        Args:
+            mutation_context (MutationContext): Current mutation context.
+        """
+        if not self._enable_state_feedback:
+            return
+
+        observation = self.state_tracker.observe(self.last_recv, test_case_index=self.total_mutant_index)
+        self._fuzz_data_logger.open_test_step("Response state feedback")
+        if observation.is_new:
+            self._fuzz_data_logger.log_pass(
+                "New response state discovered: {0} ({1} distinct state(s) so far)".format(
+                    observation.label, observation.num_states
+                )
+            )
+            self._on_new_response_state(mutation_context, observation)
+        else:
+            self._fuzz_data_logger.log_info(
+                "Known response state: {0} ({1} distinct state(s) so far)".format(
+                    observation.label, observation.num_states
+                )
+            )
+
+    def _on_new_response_state(self, mutation_context, observation):
+        """Dynamically schedule deeper exploration for a path that found a new state.
+
+        Args:
+            mutation_context (MutationContext): Mutation context that revealed the new state.
+            observation (StateObservation): The new state observation.
+        """
+        if not (self._feedback_escalate and self._feedback_iterator is not None):
+            return
+
+        depth = len(mutation_context.mutations) + 1
+        path_key = (self._message_path_to_str(mutation_context.message_path), depth)
+        if path_key in self._escalated_paths:
+            return
+        self._escalated_paths.add(path_key)
+
+        # snapshot the path: the base iterator mutates mutation_context.message_path in place
+        deeper_cases = self._generate_n_mutations_for_path(list(mutation_context.message_path), depth=depth)
+        self._feedback_iterator.inject(itertools.islice(deeper_cases, self._feedback_escalation_limit))
+        self._fuzz_data_logger.log_info(
+            "Escalating path '{0}' to combinatorial depth {1} (up to {2} additional case(s)) "
+            "after discovering {3}.".format(
+                path_key[0], depth, self._feedback_escalation_limit, observation.label
+            )
+        )
+
+    def _fresh_target_connection(self):
+        """Return a fresh, unopened connection to the first target (for crash replay)."""
+        return copy.copy(self.targets[0]._target_connection)
+
+    def _minimize_current_crash(self, test_case_name):
+        """Replay, verify and minimize the message sequence of the current failing case.
+
+        Args:
+            test_case_name (str): Name of the failing test case.
+        """
+        if not self._minimize_crashes:
+            return
+        messages = list(self._current_case_transmissions)
+        if not messages:
+            return
+
+        self._fuzz_data_logger.open_test_step("Crash replay and minimization")
+        export_dir = self._minimized_crash_dir
+        if export_dir is None:
+            export_dir = os.path.join(constants.RESULTS_DIR, "minimized-{0}".format(self._run_id))
+        minimizer = CrashMinimizer(
+            connection_factory=self._fresh_target_connection,
+            fuzz_data_logger=self._fuzz_data_logger,
+            verify_count=self._crash_verify_count,
+            export_dir=export_dir,
+        )
+        try:
+            result = minimizer.minimize(messages, test_case_name=test_case_name)
+        except Exception:
+            self._fuzz_data_logger.log_error("Crash minimization failed: {0}".format(traceback.format_exc()))
+            return
+        if result is not None:
+            self.minimized_crashes[test_case_name] = result
+
+    def state_exploration_summary(self):
+        """Return a human readable summary of response state exploration progress.
+
+        Returns:
+            str: Multi-line summary of discovered states.
+        """
+        return self.state_tracker.summary()
+
     def register_post_test_case_callback(self, method):
         """Register a post- test case method.
 
@@ -796,6 +936,7 @@ class Session(pgraph.Graph):
         try:  # send
             self.targets[0].send(data)
             self.last_send = data
+            self._current_case_transmissions.append(data)
         except exception.BoofuzzTargetConnectionReset:
             # TODO: Switch _ignore_connection_reset for _ignore_transmission_error, or provide retry mechanism
             if self._ignore_connection_reset:
@@ -861,6 +1002,7 @@ class Session(pgraph.Graph):
         try:  # send
             self.targets[0].send(data)
             self.last_send = data
+            self._current_case_transmissions.append(data)
         except exception.BoofuzzTargetConnectionReset:
             if self._ignore_connection_issues_when_sending_fuzz_data:
                 self._fuzz_data_logger.log_info(constants.ERR_CONN_RESET)
@@ -1061,6 +1203,12 @@ class Session(pgraph.Graph):
             None
         """
         self.server_init()
+
+        if self._enable_state_feedback and self._feedback_escalate:
+            fuzz_case_iterator = FeedbackCaseIterator(fuzz_case_iterator)
+            self._feedback_iterator = fuzz_case_iterator
+        else:
+            self._feedback_iterator = None
 
         try:
             self._start_target(self.targets[0])
@@ -1316,6 +1464,7 @@ class Session(pgraph.Graph):
 
         self._pause_if_pause_flag_is_set()
 
+        self._current_case_transmissions = []
         test_case_name = self._test_case_name_feature_check(mutation_context)
 
         self._fuzz_data_logger.open_test_case(
@@ -1394,6 +1543,7 @@ class Session(pgraph.Graph):
 
         self._pause_if_pause_flag_is_set()
 
+        self._current_case_transmissions = []
         test_case_name = self._test_case_name(mutation_context)
         self.current_test_case_name = test_case_name
 
@@ -1468,7 +1618,10 @@ class Session(pgraph.Graph):
             self._fuzz_data_logger.log_fail(e.message)
             self._check_for_passively_detected_failures(target=target, failure_already_detected=True)
         finally:
-            self._process_failures(target=target)
+            failure_detected = self._process_failures(target=target)
+            self._update_state_feedback(mutation_context)
+            if failure_detected:
+                self._minimize_current_crash(test_case_name)
             self._fuzz_data_logger.close_test_case()
             self.export_file()
 
